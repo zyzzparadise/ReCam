@@ -40,6 +40,41 @@ static bool read_ring(pid_t pid, uint32_t shmFd, recam::ShmHeader* out)
     return n == static_cast<ssize_t>(sizeof(*out)) && out->magic == recam::kShmMagic && out->version == recam::kShmVersion;
 }
 
+// Diagnostic only: sample the centre pixel from the most recently published
+// I420 frame. The feeder deliberately never overwrites its current slot.
+// This lets us distinguish a red/blue FFmpeg frame from the fallback bars
+// without touching cameraserver memory or copying entire video frames.
+struct PixelSample { uint8_t y = 0, cb = 0, cr = 0; };
+static bool read_lane_sample(pid_t pid, uint32_t shmFd,
+                             const recam::ShmLane& l, PixelSample* sample)
+{
+    if (!sample || !recam::lane_configured(l) || !l.published ||
+        l.dataOffset < recam::kShmArenaBase) return false;
+
+    const uint32_t slot = static_cast<uint32_t>((l.published - 1) % recam::kLaneBufs);
+    if (l.slotSeq[slot] != l.published) return false;
+    const uint64_t planeSize = static_cast<uint64_t>(l.width) * l.height;
+    const uint64_t chromaSize = planeSize / 4;
+    if (l.bufBytes != planeSize + 2 * chromaSize) return false;
+    const uint32_t x = l.width / 2, y = l.height / 2;
+    const uint64_t yOffset = static_cast<uint64_t>(y) * l.width + x;
+    const uint64_t cOffset = static_cast<uint64_t>(y / 2) * (l.width / 2) + x / 2;
+    if (yOffset >= planeSize || cOffset >= chromaSize) return false;
+
+    const uint64_t base = static_cast<uint64_t>(l.dataOffset) +
+                          static_cast<uint64_t>(slot) * l.bufBytes;
+    if (base + l.bufBytes > recam::shm_total_bytes()) return false;
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/fd/%u", pid, shmFd);
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    const bool ok = pread(fd, &sample->y, 1, static_cast<off_t>(base + yOffset)) == 1 &&
+                    pread(fd, &sample->cb, 1, static_cast<off_t>(base + planeSize + cOffset)) == 1 &&
+                    pread(fd, &sample->cr, 1, static_cast<off_t>(base + planeSize + chromaSize + cOffset)) == 1;
+    close(fd);
+    return ok;
+}
+
 static uint64_t now_ns()
 {
     struct timespec ts {};
@@ -125,11 +160,16 @@ int recam::cli::status()
             const char* state = recam::lane_state(l, feeder > 0, nowAge);
             printf("%s\n      { \"index\": %u, \"req_width\": %u, \"req_height\": %u, "
                    "\"width\": %u, \"height\": %u, \"served\": %s, "
-                   "\"published\": %llu, \"age_ms\": %lld, \"state\": \"%s\", \"scaled\": %s }",
+                   "\"published\": %llu, \"age_ms\": %lld, \"state\": \"%s\", \"scaled\": %s",
                    first ? "" : ",", i, l.reqWidth, l.reqHeight, l.width, l.height,
                    yn(strcmp(state, "served") == 0),
                    static_cast<unsigned long long>(l.published), ageMs, state,
                    yn(recam::lane_configured(l) && (l.width != l.reqWidth || l.height != l.reqHeight)));
+            PixelSample sample{};
+            if (read_lane_sample(pid, cb.shm_fd, l, &sample))
+                printf(", \"center_i420\": { \"y\": %u, \"cb\": %u, \"cr\": %u }",
+                       sample.y, sample.cb, sample.cr);
+            printf(" }");
             first = false;
         }
         printf("%s]\n", first ? "" : "\n    ");
