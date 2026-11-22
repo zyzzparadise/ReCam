@@ -24,9 +24,12 @@
 namespace recam {
 
 // UBWC has its own converter; it must never reach the linear CPU-write path.
+// NV21 (0x11) is common in MediaTek preview streams. Merely allowing the
+// format is not sufficient: its actual VU plane layout is validated after
+// the gralloc lock, before any byte is written.
 bool framehook_format_supported(int32_t f)
 {
-    if (f == 0x23 || f == 0x32315659 || f == kQcomNv12Ubwc)
+    if (f == 0x11 || f == 0x23 || f == 0x32315659 || f == kQcomNv12Ubwc)
         return true;
     return f == 0x22 && bufferlock_have_ycbcr();  // IMPLEMENTATION_DEFINED
 }
@@ -177,6 +180,26 @@ const char* fmt_name(int32_t f)
     }
 }
 
+// NV21 must be an actual semi-planar VU allocation, not an arbitrary
+// 3-plane YUV buffer mislabeled by a vendor HAL. Guard against overrunning
+// the luma allocation or writing Cb/Cr in the wrong interleave order.
+bool nv21_layout_valid(const FrameTarget& t)
+{
+    if (!t.valid() || t.y.pixelStride != 1 ||
+        t.cb.pixelStride != 2 || t.cr.pixelStride != 2 ||
+        t.cb.rowStride != t.cr.rowStride ||
+        t.y.rowStride < t.width || t.cr.rowStride < t.width)
+        return false;
+
+    const uintptr_t y = reinterpret_cast<uintptr_t>(t.y.data);
+    const uintptr_t v = reinterpret_cast<uintptr_t>(t.cr.data);
+    const uintptr_t u = reinterpret_cast<uintptr_t>(t.cb.data);
+    if (v <= y || u <= v || u - v != 1) return false;
+    const uint64_t minimumYBytes =
+        static_cast<uint64_t>(t.y.rowStride) * static_cast<uint32_t>(t.height);
+    return static_cast<uint64_t>(v - y) >= minimumYBytes;
+}
+
 extern "C" void recam_set_vendor(void* metadata, uint64_t vendor)
 {
     CallbackScope scope;
@@ -263,6 +286,26 @@ extern "C" int64_t recam_on_return_buffer(void* thiz, const void* buffer,
             bool locked = (afmt != 0x22) &&
                           bufferlock_acquire(anw, sb.releaseFence, &lb);
 
+            // Some gralloc implementations expose NV21 as a two-plane
+            // allocation, while lockPlanes may report an incompatible
+            // 3-plane view. Try the driver's android_ycbcr mapper instead.
+            if (locked && afmt == 0x11) {
+                FrameTarget probe{};
+                probe.width = aw;
+                probe.height = ah;
+                probe.format = afmt;
+                probe.y = { lb.plane[0].data, lb.plane[0].rowStride,
+                            lb.plane[0].pixelStride };
+                probe.cb = { lb.plane[1].data, lb.plane[1].rowStride,
+                             lb.plane[1].pixelStride };
+                probe.cr = { lb.plane[2].data, lb.plane[2].rowStride,
+                             lb.plane[2].pixelStride };
+                if (!nv21_layout_valid(probe)) {
+                    bufferlock_release(&lb);
+                    locked = false;
+                }
+            }
+
             // lockPlanes cannot describe IMPLEMENTATION_DEFINED; the driver can.
             const bool usedMapper = !locked;
             if (!locked)
@@ -299,6 +342,9 @@ extern "C" int64_t recam_on_return_buffer(void* thiz, const void* buffer,
                              thiz, aw, ah, afmt, usedMapper ? "mapper" : "lockPlanes",
                              t.y.rowStride, t.y.pixelStride, t.cb.rowStride, t.cb.pixelStride,
                              t.cr.rowStride, t.cr.pixelStride);
+                }
+                else if (afmt == 0x11 && !nv21_layout_valid(t)) {
+                    skip = "invalid NV21 plane layout";
                 }
                 else if (g_shm && g_shm->fill(t))  { filled = true; used = g_shm;  }
                 else if (g_bars && g_bars->fill(t)) { filled = true; used = g_bars; }
@@ -393,7 +439,11 @@ bool framehook_install(uintptr_t target)
     // Without the lock API the hook still installs and logs, it just cannot substitute.
     if (bufferlock_init()) {
         g_shm  = shmsource_get();
-        g_bars = colorbars_source();
+        // Never replace a missing or stale live frame with static bars inside
+        // cameraserver. Those bars hid working FFmpeg frames on MediaTek
+        // recording streams. The feeder still provides an animated pattern
+        // when the user selects Test pattern.
+        g_bars = nullptr;
     }
     qcom_ubwc_retry_initialization();
     capture_layout_install(target, reinterpret_cast<uintptr_t>(&recam_find_metadata),
